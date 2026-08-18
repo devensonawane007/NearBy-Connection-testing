@@ -1,17 +1,17 @@
 package com.example.samekanprivatetrekroom
 
-import android.Manifest
-import android.content.pm.PackageManager
+import android.content.Intent
 import android.os.Build
 import android.os.Bundle
-import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.compose.runtime.*
-import androidx.core.content.ContextCompat
+import com.example.samekanprivatetrekroom.data.local.Logger
+import com.example.samekanprivatetrekroom.data.local.PermissionManager
+import com.example.samekanprivatetrekroom.data.service.TrekForegroundService
 import com.example.samekanprivatetrekroom.presentation.ui.MainAppScreen
 import com.example.samekanprivatetrekroom.presentation.viewmodel.TrekRoomViewModel
 import com.example.samekanprivatetrekroom.theme.SamekanPrivateTrekRoomTheme
@@ -22,26 +22,35 @@ class MainActivity : ComponentActivity() {
     }
 
     private val viewModel: TrekRoomViewModel by viewModels()
+    private val permissionManager by lazy { PermissionManager(this) }
 
     private val permissionRequestLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { permissions ->
         val allGranted = permissions.entries.all { it.value }
-        Log.d(TAG, "Permissions callback: All granted = $allGranted")
-        hasPermissionsState.value = checkAllPermissionsGranted()
+        Logger.info(TAG, "Permissions requested callback completed. All granted = $allGranted")
+        viewModel.updatePermissionStatus()
+        if (allGranted) {
+            startTrekServiceIfPermitted()
+        }
     }
-
-    private val hasPermissionsState = mutableStateOf(false)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
 
-        hasPermissionsState.value = checkAllPermissionsGranted()
+        viewModel.updatePermissionStatus()
+
+        // Start service if permissions are already granted upfront
+        if (permissionManager.checkAllRequiredPermissionsGranted()) {
+            startTrekServiceIfPermitted()
+        } else {
+            Logger.warn(TAG, "Permissions are missing on startup. Deferring foreground service launch.")
+        }
 
         setContent {
             SamekanPrivateTrekRoomTheme {
-                val hasPermissions by remember { hasPermissionsState }
+                val hasPermissions by viewModel.hasPermissions.collectAsState()
                 MainAppScreen(
                     viewModel = viewModel,
                     hasPermissions = hasPermissions,
@@ -53,43 +62,58 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
-        hasPermissionsState.value = checkAllPermissionsGranted()
+        viewModel.updatePermissionStatus()
+        viewModel.checkBluetoothStatus()
+
+        val allGranted = permissionManager.checkAllRequiredPermissionsGranted()
+        val serviceRunning = viewModel.isServiceRunning.value
+
+        if (!allGranted && serviceRunning) {
+            Logger.warn(TAG, "Permissions revoked. Stopping TrekForegroundService gracefully.")
+            stopTrekService()
+        } else if (allGranted && !serviceRunning && viewModel.currentRoom.value != null) {
+            Logger.info(TAG, "Permissions restored. Restarting TrekForegroundService.")
+            startTrekServiceIfPermitted()
+        }
     }
 
-    private fun checkAllPermissionsGranted(): Boolean {
-        val required = getRequiredPermissions()
-        val allGranted = required.all {
-            ContextCompat.checkSelfPermission(this, it) == PackageManager.PERMISSION_GRANTED
+    private fun startTrekServiceIfPermitted() {
+        if (permissionManager.checkAllRequiredPermissionsGranted()) {
+            Logger.info(TAG, "Starting TrekForegroundService.")
+            try {
+                val intent = Intent(this, TrekForegroundService::class.java)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    startForegroundService(intent)
+                } else {
+                    startService(intent)
+                }
+                viewModel.setServiceRunning(true)
+            } catch (e: SecurityException) {
+                Logger.error(TAG, "SecurityException starting service", e)
+                viewModel.setServiceRunning(false)
+            } catch (e: Exception) {
+                Logger.error(TAG, "Failed to start service", e)
+                viewModel.setServiceRunning(false)
+            }
+        } else {
+            viewModel.setServiceRunning(false)
         }
-        Log.d(TAG, "Checking permissions: All granted = $allGranted")
-        return allGranted
+    }
+
+    private fun stopTrekService() {
+        try {
+            val intent = Intent(this, TrekForegroundService::class.java)
+            stopService(intent)
+            viewModel.setServiceRunning(false)
+            Logger.info(TAG, "TrekForegroundService stopped.")
+        } catch (e: Exception) {
+            Logger.error(TAG, "Error stopping service", e)
+        }
     }
 
     private fun requestRequiredPermissions() {
-        val required = getRequiredPermissions()
-        Log.d(TAG, "Requesting permissions: ${required.joinToString()}")
+        val required = permissionManager.getRequiredPermissions()
+        Logger.info(TAG, "Triggering runtime permissions request launcher for: ${required.joinToString()}")
         permissionRequestLauncher.launch(required)
-    }
-
-    private fun getRequiredPermissions(): Array<String> {
-        val permissions = mutableListOf(
-            Manifest.permission.ACCESS_FINE_LOCATION,
-            Manifest.permission.ACCESS_COARSE_LOCATION,
-            Manifest.permission.CAMERA
-        )
-
-        // Bluetooth Permissions Android 12+ (API 31+)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            permissions.add(Manifest.permission.BLUETOOTH_SCAN)
-            permissions.add(Manifest.permission.BLUETOOTH_CONNECT)
-            permissions.add(Manifest.permission.BLUETOOTH_ADVERTISE)
-        }
-
-        // Nearby Wi-Fi Devices Permission Android 13+ (API 33+)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            permissions.add(Manifest.permission.NEARBY_WIFI_DEVICES)
-        }
-
-        return permissions.toTypedArray()
     }
 }

@@ -6,8 +6,15 @@ import androidx.room.Room
 import androidx.room.RoomDatabase
 
 @Database(
-    entities = [RoomEntity::class, MemberEntity::class, MessageEntity::class, LocationEntity::class],
-    version = 1,
+    entities = [
+        RoomEntity::class,
+        MemberEntity::class,
+        MessageEntity::class,
+        LocationEntity::class,
+        LocationHistoryEntity::class,
+        FileTransferEntity::class
+    ],
+    version = 2,
     exportSchema = false
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -15,6 +22,8 @@ abstract class AppDatabase : RoomDatabase() {
     abstract fun memberDao(): MemberDao
     abstract fun messageDao(): MessageDao
     abstract fun locationDao(): LocationDao
+    abstract fun locationHistoryDao(): LocationHistoryDao
+    abstract fun fileTransferDao(): FileTransferDao
 
     companion object {
         @Volatile

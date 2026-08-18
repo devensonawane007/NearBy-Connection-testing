@@ -16,6 +16,9 @@ interface RoomDao {
 
     @Query("DELETE FROM trek_rooms")
     suspend fun clearRoom()
+
+    @Query("UPDATE trek_rooms SET hostDeviceId = :newHostId WHERE roomId = :roomId")
+    suspend fun updateHost(roomId: String, newHostId: String)
 }
 
 @Dao
@@ -38,6 +41,9 @@ interface MemberDao {
     @Query("UPDATE members SET connected = :connected WHERE deviceId = :deviceId")
     suspend fun updateConnectionStatus(deviceId: String, connected: Boolean)
 
+    @Query("DELETE FROM members WHERE deviceId = :deviceId")
+    suspend fun deleteMember(deviceId: String)
+
     @Query("DELETE FROM members")
     suspend fun clearMembers()
 }
@@ -52,6 +58,15 @@ interface MessageDao {
 
     @Query("UPDATE messages SET deliveryStatus = :status WHERE messageId = :messageId")
     suspend fun updateMessageStatus(messageId: String, status: String)
+
+    @Query("UPDATE messages SET reactions = :reactions WHERE messageId = :messageId")
+    suspend fun updateMessageReactions(messageId: String, reactions: String)
+
+    @Query("DELETE FROM messages WHERE messageId = :messageId")
+    suspend fun deleteMessage(messageId: String)
+
+    @Query("SELECT * FROM messages WHERE roomId = :roomId AND text LIKE '%' || :query || '%' ORDER BY timestamp ASC")
+    fun searchMessages(roomId: String, query: String): Flow<List<MessageEntity>>
 
     @Query("DELETE FROM messages")
     suspend fun clearMessages()
@@ -73,4 +88,37 @@ interface LocationDao {
 
     @Query("DELETE FROM locations")
     suspend fun clearLocations()
+}
+
+@Dao
+interface LocationHistoryDao {
+    @Query("SELECT * FROM location_history WHERE deviceId = :deviceId ORDER BY timestamp ASC")
+    fun getTrailFlow(deviceId: String): Flow<List<LocationHistoryEntity>>
+
+    @Query("SELECT * FROM location_history ORDER BY timestamp ASC")
+    fun getAllTrailsFlow(): Flow<List<LocationHistoryEntity>>
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertTrailPoint(point: LocationHistoryEntity)
+
+    @Query("DELETE FROM location_history WHERE deviceId = :deviceId")
+    suspend fun clearTrailForMember(deviceId: String)
+
+    @Query("DELETE FROM location_history")
+    suspend fun clearAllTrails()
+}
+
+@Dao
+interface FileTransferDao {
+    @Query("SELECT * FROM file_transfers ORDER BY timestamp DESC")
+    fun getTransfersFlow(): Flow<List<FileTransferEntity>>
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertTransfer(transfer: FileTransferEntity)
+
+    @Query("UPDATE file_transfers SET progress = :progress, status = :status WHERE fileId = :fileId")
+    suspend fun updateProgress(fileId: String, progress: Float, status: String)
+
+    @Query("DELETE FROM file_transfers")
+    suspend fun clearTransfers()
 }
