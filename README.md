@@ -1,32 +1,45 @@
-# Samekan Private Trek Room - Offline P2P Cluster Prototype
+# Samekan Private Trek Room - Offline P2P Cluster Trekking System
 
-This project is a standalone offline peer-to-peer group communication prototype for **Samekan**, a trekking ecosystem application. It uses Google Play Services Nearby Connections with the **`P2P_CLUSTER`** strategy to establish an authenticated, zero-internet group room between multiple physical Android phones.
+This project is a production-grade, offline-first peer-to-peer group communication application designed for the **Samekan** trekking ecosystem. Operating 100% serverless, it utilizes Google Play Services Nearby Connections with the **`P2P_CLUSTER`** strategy to establish an authenticated, zero-internet communication mesh between multiple physical Android devices.
 
-## Features Built
-1. **P2P Cluster Networking**: Direct M-to-N peer-to-peer connection topology using Nearby Connections API.
-2. **Offline Room Concept**: Local room creation (QR generation) and joining (QR scan via CameraX & ZXing) without a centralized backend or Firebase.
-3. **Manual Authentication**: PIN code display and verification (`ACCEPT`/`REJECT` dialogs) to authorize room join requests.
-4. **GPS Sharing**: High-accuracy local coordinates (Fused Location Provider) broadcasted to direct peers every 10 seconds.
-5. **Private Trek Radar**: A custom Compass/Radar Compose Canvas plotting members relative to the user's location with concentric range rings (up to 250m).
-6. **Chat Log**: Local room messaging showing delivery state (`SENDING`, `SENT`, `FAILED`).
-7. **Local Persistence**: Jetpack Room Database storing rooms, active members, messages, and coordinates.
-8. **Connection Recovery**: Auto-reconnection with exponential backoff.
+The project is fully refactored to comply with Android 14+ (API 34-36) Foreground Service (FGS), runtime permission, and Google Play console compliance requirements.
 
 ---
 
-## Technical Architecture & Setup
+## Technical Architecture & Compliance (Android 14+)
 
-### Requirements
+### 1. Foreground Service Decoupling
+- **Decoupled FGS Types**: The persistent background service (`TrekForegroundService`) is configured in the manifest to run using only the `location` and `connectedDevice` types. It coordinates GPS polling and Nearby Connection network advertising/discovery in the background.
+- **On-Demand Microphone**: Access to the microphone (`RECORD_AUDIO`) is requested only during active Push-To-Talk (PTT) use in the foreground. The foreground service does NOT run with `microphone` type continuously, eliminating immediate startup crashes on Android 14+ devices.
+- **Crash Prevention**: All calls transitioning to Foreground Service are wrapped in try-catch blocks to catch `SecurityException` gracefully.
+
+### 2. Consolidated Permission Manager
+- **Dynamic API Mapping**: Centralized in `PermissionManager` to check and request the exact permissions needed depending on the device's Android OS version (handling Bluetooth Scan/Connect/Advertise on API 31+, and Nearby WiFi / Post Notifications on API 33+).
+- **Graceful Revocation**: Monitors permission states dynamically. If permissions are revoked during runtime, the background service is immediately stopped to prevent crashes.
+- **Rationale Dialogs**: Built a beautiful Compose Permission Screen explaining exactly why each permission is required (e.g. Bluetooth for offline mesh, Location for radar coordinates, Camera for room QR scanning, Microphone for PTT walkie-talkie).
+
+### 3. Hardware Lifecycle Optimizations
+- **On-Demand PTT Recorder**: In `PTTManager`, the `AudioRecord` is instantiated only when the user presses and holds the microphone button, and is immediately released and destroyed when the user releases it. No microphone resources are held in the background.
+- **Adaptive GPS Tracker**: In `GpsManager`, coordinate requests are dynamically adjusted based on permissions, airplane mode, battery saver settings, and system provider states, reporting status flags to the UI.
+- **Multi-Hop SOS Mesh**: High-priority SOS packets propagate through peers using mesh routing (automatically decrementing TTL limits and dropping duplicate packet IDs) to extend coverage across rugged trails.
+
+### 4. Consolidated Logger Utility
+- **Diagnostic Terminal**: The central `Logger` coordinates log messages (`debug`, `info`, `warn`, `error`) and forwards them directly to the UI diagnostic monitor while mirroring to Android Logcat.
+
+---
+
+## Technical Specifications & Setup
+
 * **Minimum SDK**: Android 10+ (API 29)
 * **Target SDK**: Android 14+ (API 34/36)
-* **Gradle Toolchain**: JDK 17 or JDK 21 (for build configuration compatibility)
-* **Hardware**: Physical devices must support Bluetooth LE, Wi-Fi Direct, and GPS.
+* **Gradle Toolchain**: JDK 17 (Eclipse Adoptium 17)
+* **Hardware**: Physical devices with functional Bluetooth, Wi-Fi, and GPS antennas.
 
 ### Build Instructions
-Run the following build command using your Gradle wrapper. Ensure `JAVA_HOME` is pointed to JDK 17+:
+Specify the JDK 17 path in `gradle.properties` (`org.gradle.java.home=...`) or run compiling via:
 ```powershell
 # On Windows PowerShell
-$env:JAVA_HOME="C:\Path\To\JDK17_or_21"
+.\gradlew.bat compileDebugKotlin
 .\gradlew.bat assembleDebug
 ```
 The compiled APK will be generated at:
@@ -34,71 +47,68 @@ The compiled APK will be generated at:
 
 ---
 
-## 4-Phone Testing Instructions
+## 4-Phone Testing Script
 
-Follow this structured test script on **4 physical Android devices** (e.g., Phone A, B, C, and D) to verify P2P cluster behavior:
+Follow this script using **4 physical Android devices** (e.g., Phone A, B, C, and D) to verify ad-hoc cluster capabilities:
 
 ### Preparation
-1. Install the `app-debug.apk` on all 4 phones.
-2. On every phone, toggle **Mobile Data OFF** and **Wi-Fi Internet OFF** (keep the Wi-Fi and Bluetooth antennas turned **ON** in settings; do not connect to any access point).
-3. Open the app and grant the required permissions (Bluetooth, Location, Camera).
-4. Tap the Edit button on the Profile Card and set distinct names (e.g., `A-Venn`, `B-Kshitij`, `C-Ved`, `D-Amogh`).
+1. Install `app-debug.apk` on all 4 phones.
+2. Toggle **Mobile Data OFF** and **Wi-Fi Internet OFF** (keep Bluetooth and Wi-Fi antennas turned **ON** in settings; do not connect to any access point).
+3. Open the app and grant the requested permissions. Set distinct trekker names (e.g., `Leader-Venn`, `Walker-Kshitij`, `Walker-Ved`, `Sweep-Amogh`).
 
 ---
 
-### Test 1: Two-Phone Connection
-1. **Phone A**: Tap **CREATE NEW ROOM**. Enter room name `"Rajgad Sunday Trek"`.
-2. A QR Code containing the generated Room ID (e.g., `T-ROOM-RAJ8`) will be displayed.
-3. **Phone B**: Tap **SCAN CODE** and scan Phone A's screen.
-4. An authentication modal showing matching digits (e.g., `123-456`) will pop up on both screens.
-5. Tap **[ ACCEPT ]** on both phones.
-6. **Verification**: 
-   * The status bar transitions to `OFFLINE` (Internet) and show active advertising/discovery flags.
-   * Both phones show each other under the **Members** tab as `🟢 CONNECTED`.
+### Test 1: Two-Phone Connection & FGS Boot
+1. **Phone A**: Tap **CREATE OFFLINE ROOM**. Enter room name `"Rajgad Sunday Trek"`.
+2. A QR Code containing the Room ID (e.g. `T-ROOM-RAJ8`) is displayed.
+3. **Phone B**: Tap **SCAN QR** and scan Phone A's screen.
+4. Verify matching authentication digits (e.g., `123-456`) and tap **ACCEPT** on both.
+5. **Verification**:
+   * The top status bar displays active indicators: `BT` (active), `GPS` (active), `FGS` (active), `PERM` (active).
+   * Both phones show each other under the **Group** tab as `🟢 CONNECTED`.
 
 ### Test 2: Multi-Peer Mesh (4 Phones)
 1. **Phone A**: Tap the QR icon in the top bar to display the Room QR.
-2. **Phone C** & **Phone D**: Tap **SCAN CODE** and scan the QR from Phone A.
-3. Verify and tap **[ ACCEPT ]** on the corresponding authentication modals.
+2. **Phone C** & **Phone D**: Scan the QR from Phone A.
+3. Verify the authentication PIN and tap **ACCEPT**.
 4. **Verification**:
-   * All 4 devices should dynamically connect to one another in the P2P cluster.
-   * Go to the **Debug** tab on any phone: under `RAW CONNECTED ENDPOINTS`, verify that multiple simultaneous connection entries are active (A displays B, C, D; B displays A, C, D, etc.).
+   * Go to the **Group** tab on any phone: verify that all 4 devices are connected to the cluster.
+   * Go to the **Diag** tab: verify the active peers count shows `PEERS: 3` and that packet counters update dynamically.
 
-### Test 3: Broadcast Chat
+### Test 3: Broadcast Chat & Replies
 1. Go to the **Chat** tab on **Phone A**.
 2. Type `"Reached checkpoint 2. Waiting near water point."` and tap **Send**.
 3. **Verification**:
-   * All active phones (B, C, and D) immediately receive the message with `A-Venn` as the sender.
-   * On Phone A, the message indicator transitions from `PENDING` (yellow icon) to `SENT` (green checkmark).
+   * All phones (B, C, D) receive the message immediately.
+   * Long-press the received message on **Phone B**, select **Reply**, type `"Roger that, we are 5 mins away."`, and send.
+   * Verify thread reply hierarchy renders correctly on all devices.
 
-### Test 4: Real-time GPS sharing & Trek Radar
-1. Verify that all 4 phones have a GPS lock.
-2. Go to the **Radar** tab on **Phone A**.
+### Test 4: Push-to-Talk (PTT) Voice Walkie-Talkie
+1. Go to the **Chat** tab on **Phone B**.
+2. Press and hold the green **Microphone** icon. Speak into the microphone.
 3. **Verification**:
-   * Phone A is represented by the bright green dot at the center.
-   * The relative locations of B, C, and D are plotted as dots with their names, updating dynamically.
-   * Go to the **Members** tab on **Phone A** and check the listed distances: verify they match geographic calculations (e.g. `B-Kshitij: 84 m away (Close)`).
+   * Phone B's microphone status icon glows red.
+   * An active wave progress indicator reflects live audio levels.
+   * Release the button: verify the microphone icon in the device status bar disappears immediately.
+   * Phones A, C, and D play the voice message sequentially using Mu-Law decompression.
 
-### Test 5: Local Boot Validation (No Internet Cold Boot)
-1. Close the app and toggle Airplane mode ON then OFF on all phones (ensuring Wi-Fi/data remain fully disconnected).
-2. Start the app. It will restore the last room configuration, start advertising/discovery, and update coordinates.
+### Test 5: Multi-Hop SOS Emergency Relay
+1. Move **Phone D** far away, such that it can ONLY reach **Phone C**, but has lost direct connection to **Phone A** and **Phone B**.
+2. **Phone D**: Go to the **Group** tab, tap **TRIGGER EMERGENCY SOS**, select **Wildlife Danger**, and confirm.
+3. **Verification**:
+   * Phone C receives the SOS packet, starts flashing the screen red, playing a siren sound, and showing Phone D's battery/coordinates.
+   * Phone C decrements the SOS packet's TTL and automatically relays it to A and B.
+   * Phone A and B (despite being out of range of D) receive the SOS, play the alarm, and render direction guides showing distance/bearing to Phone D.
+   * Tap **SEND ACKNOWLEDGEMENT** on Phone A: verify that D receives the ack packet via the mesh relay and silences its local emergency alert.
 
-### Test 6 & 7: Connection Loss & Auto-Recovery
-1. Move **Phone D** out of wireless range (or temporarily turn Bluetooth OFF on Phone D).
-2. **Verification on A, B, C**:
-   * Phone D's status changes to `🔴 DISCONNECTED` under the Members tab.
-   * Phone D's last known location and details remain visible but its radar dot reflects the disconnected color.
-3. Bring **Phone D** back into range (or turn Bluetooth ON again).
-4. **Verification**:
-   * Nearby Connections discovery triggers automatically.
-   * The connection is restored, and the status returns to `🟢 CONNECTED` without manually re-creating the room.
+### Test 6: Offline Trail Map
+1. Walk 50 meters with **Phone B** in any direction.
+2. **Verification on Phone A**:
+   * Go to the **Map** tab.
+   * Verify that Phone B's movements are tracked as breadcrumbs on the zoomable Canvas vector map.
+   * Toggle **Heading Sync**: verify the canvas rotates dynamically based on the compass direction.
 
----
-
-## Known Android & Device Limitations
-
-Keep these hardware and operating system constraints in mind during testing:
-1. **Radio Interferences**: Since Nearby Connections uses Wi-Fi and Bluetooth concurrently, devices sharing high amounts of data may experience packet latency if both antennas share a single hardware chip (common in older budget phones).
-2. **Location Services Requirement**: Android requires Location services (GPS) to be actively turned on in system settings for Bluetooth LE and Wi-Fi scanning to function.
-3. **Wi-Fi Direct Coexistence**: On some Android 10/11 devices, starting advertising and discovery simultaneously under `P2P_CLUSTER` can cause the device to toggle its Wi-Fi hotspot, which may disconnect it from existing local Wi-Fi networks.
-4. **Background Restrictions**: If the app is minimized, Android's battery manager may restrict Bluetooth scanning. Keep the app in the foreground during multi-peer testing for optimal performance.
+### Test 7: Local Boot Validation & Connection Recovery
+1. Force close the app on **Phone B** (simulating a crash or battery pull).
+2. Start the app. Verify it restores the last room config automatically and re-registers listeners.
+3. Bring B back near the other phones: verify Nearby Connections auto-reconnects with exponential backoff, restoring connections without requiring a manual QR scan.
