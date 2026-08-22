@@ -10,7 +10,9 @@ enum class PacketType {
     SOS_ACK,
     CHAT_ACK,
     CHAT_READ,
-    FILE_HEADER
+    FILE_HEADER,
+    FILE_CHUNK,
+    TYPING
 }
 
 data class SamekanPacket(
@@ -22,7 +24,10 @@ data class SamekanPacket(
     val timestamp: Long,
     val ttl: Int,
     val payload: String,
-    val targetDeviceId: String? = null
+    val targetDeviceId: String? = null,
+    val hopCount: Int = 0,
+    val sequenceNumber: Long = 0L,
+    val priority: Int = 1 // 0 = HIGH (SOS), 1 = MEDIUM (Voice/Chat), 2 = LOW (GPS/Logs)
 )
 
 data class GpsPayload(
@@ -50,8 +55,10 @@ data class Peer(
     val roomId: String,
     val connected: Boolean,
     val lastSeen: Long,
-    val role: String = "MEMBER",
-    val rssi: Int? = null
+    val role: String = "MEMBER", // HOST, MEMBER
+    val rssi: Int? = null,
+    val batteryLevel: Int = 100,
+    val latencyMs: Long = 0L
 )
 
 data class MemberLocation(
@@ -77,23 +84,37 @@ data class MemberSyncInfo(
 )
 
 data class SosPayload(
-    val emergencyType: String, // Lost, Injury, Wildlife, Weather, Other
+    val emergencyType: String, // Lost, Injury, Wildlife, Weather, Medical, Fall, Fire, Flood, Landslide, Avalanche, Other
     val latitude: Double,
     val longitude: Double,
     val altitude: Double,
     val accuracy: Float,
-    val batteryLevel: Int
+    val batteryLevel: Int,
+    val heading: Float = 0f,
+    val speed: Float = 0f
 )
 
 data class FileHeaderPayload(
     val fileId: String,
     val fileName: String,
     val fileType: String,
-    val fileSize: Long
+    val fileSize: Long,
+    val checksum: String = "",
+    val totalChunks: Int = 0
+)
+
+data class FileChunkPayload(
+    val fileId: String,
+    val chunkIndex: Int,
+    val totalChunks: Int,
+    val data: String // Base64 encoded chunk data
+)
+
+data class TypingPayload(
+    val isTyping: Boolean
 )
 
 data class RoomQrData(
     val roomId: String,
     val roomName: String
 )
-

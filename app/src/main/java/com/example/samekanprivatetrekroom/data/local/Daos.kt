@@ -62,6 +62,9 @@ interface MessageDao {
     @Query("UPDATE messages SET reactions = :reactions WHERE messageId = :messageId")
     suspend fun updateMessageReactions(messageId: String, reactions: String)
 
+    @Query("UPDATE messages SET isPinned = :pinned WHERE messageId = :messageId")
+    suspend fun updateMessagePinned(messageId: String, pinned: Boolean)
+
     @Query("DELETE FROM messages WHERE messageId = :messageId")
     suspend fun deleteMessage(messageId: String)
 
@@ -119,6 +122,87 @@ interface FileTransferDao {
     @Query("UPDATE file_transfers SET progress = :progress, status = :status WHERE fileId = :fileId")
     suspend fun updateProgress(fileId: String, progress: Float, status: String)
 
+    @Query("UPDATE file_transfers SET progress = :progress, status = :status, chunkIndex = :chunkIndex WHERE fileId = :fileId")
+    suspend fun updateProgressAndChunk(fileId: String, progress: Float, status: String, chunkIndex: Int)
+
     @Query("DELETE FROM file_transfers")
     suspend fun clearTransfers()
+}
+
+@Dao
+interface SosHistoryDao {
+    @Query("SELECT * FROM sos_history ORDER BY timestamp DESC")
+    fun getSosHistoryFlow(): Flow<List<SosHistoryEntity>>
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertSosAlert(alert: SosHistoryEntity)
+
+    @Query("UPDATE sos_history SET status = :status WHERE messageId = :messageId")
+    suspend fun updateSosStatus(messageId: String, status: String)
+
+    @Query("DELETE FROM sos_history")
+    suspend fun clearSosHistory()
+}
+
+@Dao
+interface VoiceHistoryDao {
+    @Query("SELECT * FROM voice_history ORDER BY timestamp DESC")
+    fun getVoiceHistoryFlow(): Flow<List<VoiceHistoryEntity>>
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertVoiceLog(voice: VoiceHistoryEntity)
+
+    @Query("DELETE FROM voice_history")
+    suspend fun clearVoiceHistory()
+}
+
+@Dao
+interface PacketLogDao {
+    @Query("SELECT * FROM packet_logs ORDER BY timestamp DESC LIMIT 200")
+    fun getPacketLogsFlow(): Flow<List<PacketLogEntity>>
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertPacketLog(log: PacketLogEntity)
+
+    @Query("DELETE FROM packet_logs")
+    suspend fun clearPacketLogs()
+}
+
+@Dao
+interface DiagnosticsDao {
+    @Query("SELECT * FROM diagnostics ORDER BY timestamp DESC LIMIT 100")
+    fun getDiagnosticsFlow(): Flow<List<DiagnosticsEntity>>
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertDiagnostics(diag: DiagnosticsEntity)
+
+    @Query("DELETE FROM diagnostics")
+    suspend fun clearDiagnostics()
+}
+
+@Dao
+interface MemberStatsDao {
+    @Query("SELECT * FROM member_stats ORDER BY displayName ASC")
+    fun getMemberStatsFlow(): Flow<List<MemberStatsEntity>>
+
+    @Query("SELECT * FROM member_stats WHERE deviceId = :deviceId LIMIT 1")
+    suspend fun getStatsForMember(deviceId: String): MemberStatsEntity?
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertMemberStats(stats: MemberStatsEntity)
+
+    @Query("DELETE FROM member_stats")
+    suspend fun clearMemberStats()
+}
+
+@Dao
+interface BatteryHistoryDao {
+    @Query("SELECT * FROM battery_history WHERE deviceId = :deviceId ORDER BY timestamp ASC")
+    fun getBatteryHistoryFlow(deviceId: String): Flow<List<BatteryHistoryEntity>>
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertBatteryPoint(point: BatteryHistoryEntity)
+
+    @Query("DELETE FROM battery_history")
+    suspend fun clearBatteryHistory()
 }

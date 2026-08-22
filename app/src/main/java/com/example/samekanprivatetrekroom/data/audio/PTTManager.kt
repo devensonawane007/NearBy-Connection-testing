@@ -9,10 +9,12 @@ import android.media.AudioTrack
 import android.media.MediaRecorder
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
-import java.util.concurrent.LinkedBlockingQueue
+import java.util.PriorityQueue
+import java.util.concurrent.locks.ReentrantLock
 import kotlin.math.sqrt
 import com.example.samekanprivatetrekroom.data.local.Logger
 import com.example.samekanprivatetrekroom.data.local.PermissionManager
@@ -80,6 +82,8 @@ class PTTManager(private val context: Context) {
         private const val CHANNEL_OUT = AudioFormat.CHANNEL_OUT_MONO
         private const val AUDIO_FORMAT = AudioFormat.ENCODING_PCM_16BIT
         private const val BUFFER_SIZE_FACTOR = 2
+        private const val JITTER_BUFFER_MIN_SIZE = 3
+        private const val JITTER_BUFFER_DELAY_MS = 150L
     }
 
     private var audioRecord: AudioRecord? = null
@@ -87,7 +91,15 @@ class PTTManager(private val context: Context) {
     private var isRecording = false
     private var isPlaying = false
 
-    private val playbackQueue = LinkedBlockingQueue<ShortArray>()
+    // Jitter Buffer variables
+    data class AudioSegment(val seq: Long, val pcm: ShortArray) : Comparable<AudioSegment> {
+        override fun compareTo(other: AudioSegment): Int = this.seq.compareTo(other.seq)
+    }
+    private val jitterBuffer = PriorityQueue<AudioSegment>()
+    private val bufferLock = ReentrantLock()
+    private var expectedSeq = -1L
+    private var lastChunkSize = 1024
+
     private val scope = CoroutineScope(Dispatchers.Default)
 
     // UI state flows
@@ -103,9 +115,10 @@ class PTTManager(private val context: Context) {
     private val _audioLevel = MutableStateFlow(0f)
     val audioLevel = _audioLevel.asStateFlow()
 
-    private var onChunkRecorded: ((ByteArray) -> Unit)? = null
+    private var onChunkRecorded: ((ByteArray, Long) -> Unit)? = null
+    private var localRecordSeq = 0L
 
-    fun setOnChunkRecordedListener(listener: (ByteArray) -> Unit) {
+    fun setOnChunkRecordedListener(listener: (ByteArray, Long) -> Unit) {
         onChunkRecorded = listener
     }
 
@@ -116,6 +129,11 @@ class PTTManager(private val context: Context) {
         val permissionManager = PermissionManager(context)
         if (!permissionManager.isPermissionGranted(android.Manifest.permission.RECORD_AUDIO)) {
             Logger.warn(TAG, "PTT recording requested but RECORD_AUDIO permission is not granted.")
+            return
+        }
+
+        if (isPlaying) {
+            Logger.warn(TAG, "Cannot start recording while incoming voice stream is playing.")
             return
         }
 
@@ -144,6 +162,7 @@ class PTTManager(private val context: Context) {
             audioRecord?.startRecording()
             isRecording = true
             _isRecordingFlow.value = true
+            localRecordSeq = 0L
             Logger.info(TAG, "PTT recording started.")
 
             scope.launch(Dispatchers.IO) {
@@ -159,7 +178,7 @@ class PTTManager(private val context: Context) {
                         _audioLevel.value = (rms / maxRms).coerceIn(0f, 1f)
 
                         val compressed = MuLawCodec.encode(activeBuffer)
-                        onChunkRecorded?.invoke(compressed)
+                        onChunkRecorded?.invoke(compressed, localRecordSeq++)
                     }
                 }
             }
@@ -184,12 +203,24 @@ class PTTManager(private val context: Context) {
         audioRecord = null
     }
 
-    fun playAudioChunk(speakerName: String, compressedData: ByteArray) {
+    fun playAudioChunk(speakerName: String, seq: Long, compressedData: ByteArray) {
+        if (isRecording) {
+            Logger.debug(TAG, "Ignoring incoming voice packet since we are recording.")
+            return
+        }
+
         _currentSpeaker.value = speakerName
         _isPlayingFlow.value = true
 
         val pcmData = MuLawCodec.decode(compressedData)
-        playbackQueue.offer(pcmData)
+        lastChunkSize = pcmData.size
+
+        bufferLock.lock()
+        try {
+            jitterBuffer.add(AudioSegment(seq, pcmData))
+        } finally {
+            bufferLock.unlock()
+        }
 
         if (!isPlaying) {
             startPlaybackLoop()
@@ -219,20 +250,80 @@ class PTTManager(private val context: Context) {
             }
 
             audioTrack?.play()
-            Logger.info(TAG, "PTT voice playback stream started.")
+            Logger.info(TAG, "PTT voice playback stream started with Jitter Buffer.")
 
             scope.launch(Dispatchers.IO) {
+                expectedSeq = 0L
+                var idleAttempts = 0
+
+                // Prefill Jitter Buffer to counter initial jitter
+                while (true) {
+                    var bufferSize: Int
+                    bufferLock.lock()
+                    try {
+                        bufferSize = jitterBuffer.size
+                    } finally {
+                        bufferLock.unlock()
+                    }
+                    if (bufferSize >= JITTER_BUFFER_MIN_SIZE || idleAttempts > 15) {
+                        break
+                    }
+                    delay(10)
+                    idleAttempts++
+                }
+
+                idleAttempts = 0
                 while (isPlaying) {
-                    val chunk = playbackQueue.poll()
-                    if (chunk != null) {
-                        val rms = calculateRms(chunk)
+                    var segment: AudioSegment? = null
+                    bufferLock.lock()
+                    try {
+                        if (jitterBuffer.isNotEmpty()) {
+                            val top = jitterBuffer.peek()
+                            if (top != null) {
+                                if (top.seq == expectedSeq) {
+                                    segment = jitterBuffer.poll()
+                                } else if (top.seq < expectedSeq) {
+                                    // Late packet, drop it
+                                    jitterBuffer.poll()
+                                }
+                            }
+                        }
+                    } finally {
+                        bufferLock.unlock()
+                    }
+
+                    if (segment != null) {
+                        idleAttempts = 0
+                        val rms = calculateRms(segment.pcm)
                         val maxRms = 32767f
                         _audioLevel.value = (rms / maxRms).coerceIn(0f, 1f)
 
-                        audioTrack?.write(chunk, 0, chunk.size)
+                        audioTrack?.write(segment.pcm, 0, segment.pcm.size)
+                        expectedSeq++
                     } else {
-                        if (playbackQueue.isEmpty()) {
-                            break
+                        // Loss Concealment or Waiting
+                        delay(20)
+                        
+                        var size: Int
+                        bufferLock.lock()
+                        try {
+                            size = jitterBuffer.size
+                        } finally {
+                            bufferLock.unlock()
+                        }
+
+                        if (size > 0) {
+                            // Gap detected in sequence numbers. Write silent frame to conceal.
+                            Logger.warn(TAG, "Concealing loss for expected sequence: $expectedSeq")
+                            val silenceFrame = ShortArray(lastChunkSize)
+                            audioTrack?.write(silenceFrame, 0, silenceFrame.size)
+                            _audioLevel.value = 0f
+                            expectedSeq++
+                        } else {
+                            idleAttempts++
+                            if (idleAttempts > 15) { // ~300ms of silence
+                                break
+                            }
                         }
                     }
                 }
@@ -250,7 +341,13 @@ class PTTManager(private val context: Context) {
         _isPlayingFlow.value = false
         _currentSpeaker.value = null
         _audioLevel.value = 0f
-        playbackQueue.clear()
+        bufferLock.lock()
+        try {
+            jitterBuffer.clear()
+        } finally {
+            bufferLock.unlock()
+        }
+        expectedSeq = -1L
         Logger.info(TAG, "PTT voice playback stream stopped.")
         try {
             audioTrack?.stop()

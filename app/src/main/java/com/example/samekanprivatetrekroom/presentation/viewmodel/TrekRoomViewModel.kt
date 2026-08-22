@@ -20,17 +20,21 @@ import com.example.samekanprivatetrekroom.domain.model.*
 import com.example.samekanprivatetrekroom.domain.serializer.PacketSerializer
 import com.example.samekanprivatetrekroom.location.GpsManager
 import com.example.samekanprivatetrekroom.location.GpsStatus
-import com.google.gson.Gson
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 import java.io.File
+import java.io.RandomAccessFile
+import java.security.MessageDigest
 import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
 
 class TrekRoomViewModel(application: Application) : AndroidViewModel(application) {
     companion object {
         private const val TAG = "TrekRoomViewModel"
+        private const val CHUNK_SIZE = 32768 // 32KB
     }
 
     private val db = AppDatabase.getDatabase(application)
@@ -40,6 +44,12 @@ class TrekRoomViewModel(application: Application) : AndroidViewModel(application
     private val locationDao = db.locationDao()
     private val locationHistoryDao = db.locationHistoryDao()
     private val fileTransferDao = db.fileTransferDao()
+    private val sosHistoryDao = db.sosHistoryDao()
+    private val voiceHistoryDao = db.voiceHistoryDao()
+    private val packetLogDao = db.packetLogDao()
+    private val diagnosticsDao = db.diagnosticsDao()
+    private val memberStatsDao = db.memberStatsDao()
+    private val batteryHistoryDao = db.batteryHistoryDao()
 
     val prefs = PreferenceHelper(application)
     val permissionManager = PermissionManager(application)
@@ -106,12 +116,39 @@ class TrekRoomViewModel(application: Application) : AndroidViewModel(application
     val isDiscovering = nearbyConnectionManager.isDiscovering
     val pendingRequests = nearbyConnectionManager.pendingRequests
 
-    // Diagnostics stats
+    // Diagnostics stats from Nearby Connection Manager
     val totalPacketsSent = nearbyConnectionManager.totalPacketsSent
     val totalPacketsReceived = nearbyConnectionManager.totalPacketsReceived
     val droppedPackets = nearbyConnectionManager.droppedPackets
     val totalRelays = nearbyConnectionManager.totalRelays
     val averageLatencyMs = nearbyConnectionManager.averageLatencyMs
+    val packetLossRate = nearbyConnectionManager.packetLossRate
+    val estimatedBandwidthBps = nearbyConnectionManager.estimatedBandwidthBps
+    val estimatedTransport = nearbyConnectionManager.estimatedTransport
+
+    // Room DB Live lists
+    val packetLogs: StateFlow<List<PacketLogEntity>> = packetLogDao.getPacketLogsFlow()
+        .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
+
+    val sosHistory: StateFlow<List<SosHistoryEntity>> = sosHistoryDao.getSosHistoryFlow()
+        .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
+
+    val voiceHistory: StateFlow<List<VoiceHistoryEntity>> = voiceHistoryDao.getVoiceHistoryFlow()
+        .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
+
+    val diagnostics: StateFlow<List<DiagnosticsEntity>> = diagnosticsDao.getDiagnosticsFlow()
+        .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
+
+    val memberStats: StateFlow<List<MemberStatsEntity>> = memberStatsDao.getMemberStatsFlow()
+        .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
+
+    // Typing state of active peers: map of deviceId -> displayName
+    private val _typingPeers = MutableStateFlow<Map<String, String>>(emptyMap())
+    val typingPeers: StateFlow<Map<String, String>> = _typingPeers.asStateFlow()
+    private val typingTimestamps = ConcurrentHashMap<String, Long>()
+
+    // File transfer active jobs
+    private val fileSendingJobs = ConcurrentHashMap<String, Job>()
 
     // Combine Room DB members with active Nearby connection state
     val peers: StateFlow<List<Peer>> = combine(
@@ -127,7 +164,10 @@ class TrekRoomViewModel(application: Application) : AndroidViewModel(application
                 roomId = nearbyPeer?.roomId ?: "",
                 connected = nearbyPeer?.isConnected == true || dbMember.deviceId == localDeviceId,
                 lastSeen = dbMember.lastSeen,
-                role = dbMember.role
+                role = dbMember.role,
+                rssi = nearbyPeer?.rssi,
+                batteryLevel = dbMember.batteryLevel,
+                latencyMs = nearbyPeer?.latencyMs ?: 0L
             )
         }
     }.stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
@@ -169,6 +209,7 @@ class TrekRoomViewModel(application: Application) : AndroidViewModel(application
 
         // Set up nearby packet receiver
         nearbyConnectionManager.onPacketReceivedListener = { packet ->
+            logPacketTraffic(packet, "RECEIVED")
             handleReceivedPacket(packet)
         }
 
@@ -180,8 +221,27 @@ class TrekRoomViewModel(application: Application) : AndroidViewModel(application
             }
         }
 
-        // Setup PTT recorded chunk callback
-        pttManager.setOnChunkRecordedListener { compressedAudio ->
+        // Set up reliable packet ACK listener
+        nearbyConnectionManager.onPacketAckedListener = { ackedId ->
+            viewModelScope.launch(Dispatchers.IO) {
+                if (ackedId.startsWith("MSG-")) {
+                    messageDao.updateMessageStatus(ackedId, "SENT")
+                } else if (ackedId.startsWith("FC-")) {
+                    // Ack of file chunk. Handled if selective repeat is active.
+                }
+            }
+        }
+
+        nearbyConnectionManager.onPacketFailedListener = { failedPacket ->
+            viewModelScope.launch(Dispatchers.IO) {
+                if (failedPacket.messageId.startsWith("MSG-")) {
+                    messageDao.updateMessageStatus(failedPacket.messageId, "FAILED")
+                }
+            }
+        }
+
+        // Setup PTT recorded chunk callback with packet sequencing
+        pttManager.setOnChunkRecordedListener { compressedAudio, seq ->
             val room = currentRoom.value
             if (room != null) {
                 val packet = SamekanPacket(
@@ -192,39 +252,12 @@ class TrekRoomViewModel(application: Application) : AndroidViewModel(application
                     type = PacketType.PTT_CHUNK,
                     timestamp = System.currentTimeMillis(),
                     ttl = 1,
-                    payload = android.util.Base64.encodeToString(compressedAudio, android.util.Base64.NO_WRAP)
+                    payload = android.util.Base64.encodeToString(compressedAudio, android.util.Base64.NO_WRAP),
+                    sequenceNumber = seq,
+                    priority = 1
                 )
+                logPacketTraffic(packet, "SENT")
                 nearbyConnectionManager.broadcastPacket(packet)
-            }
-        }
-
-        // Setup file transfer progress callback
-        nearbyConnectionManager.onFileTransferProgressListener = { payloadId, progress, status, file ->
-            viewModelScope.launch(Dispatchers.IO) {
-                val dbTransfers = fileTransferDao.getTransfersFlow().first()
-                val transfer = dbTransfers.find { it.fileId == payloadId.toString() }
-                if (transfer != null) {
-                    val updatedStatus = if (status == "COMPLETED") "COMPLETED" else if (status == "FAILED") "FAILED" else "SENDING"
-                    fileTransferDao.updateProgress(
-                        fileId = payloadId.toString(),
-                        progress = progress,
-                        status = updatedStatus
-                    )
-                } else if (file != null) {
-                    val incomingFile = FileTransferEntity(
-                        fileId = payloadId.toString(),
-                        fileName = file.name,
-                        fileType = "IMAGE",
-                        absolutePath = file.absolutePath,
-                        isIncoming = true,
-                        progress = 1.0f,
-                        status = "COMPLETED",
-                        timestamp = System.currentTimeMillis(),
-                        senderId = "Unknown",
-                        fileSize = file.length()
-                    )
-                    fileTransferDao.insertTransfer(incomingFile)
-                }
             }
         }
 
@@ -239,13 +272,112 @@ class TrekRoomViewModel(application: Application) : AndroidViewModel(application
             }
         }
 
+        // Diagnostics logging and battery history scheduler
+        viewModelScope.launch(Dispatchers.IO) {
+            while (true) {
+                delay(15000)
+                val room = currentRoom.value
+                if (room != null) {
+                    val batt = getBatteryLevel()
+                    batteryHistoryDao.insertBatteryPoint(
+                        BatteryHistoryEntity(
+                            deviceId = localDeviceId,
+                            batteryLevel = batt,
+                            timestamp = System.currentTimeMillis()
+                        )
+                    )
+                    
+                    val activeList = mutableListOf<String>()
+                    if (isAdvertising.value) activeList.add("Advertising")
+                    if (isDiscovering.value) activeList.add("Discovery")
+                    if (pttManager.isRecordingFlow.value) activeList.add("PTT Mic")
+                    
+                    diagnosticsDao.insertDiagnostics(
+                        DiagnosticsEntity(
+                            timestamp = System.currentTimeMillis(),
+                            connectedPeersCount = peers.value.count { it.connected && it.deviceId != localDeviceId },
+                            avgLatencyMs = averageLatencyMs.value,
+                            packetLossRate = packetLossRate.value,
+                            bandwidthBps = estimatedBandwidthBps.value,
+                            batteryLevel = batt,
+                            activeTransports = activeList.joinToString(", ")
+                        )
+                    )
+                }
+            }
+        }
+
+        // Typing indicator cleanup task
+        viewModelScope.launch {
+            while (true) {
+                delay(1000)
+                val now = System.currentTimeMillis()
+                val currentTyping = _typingPeers.value.toMutableMap()
+                var changed = false
+                typingTimestamps.forEach { (deviceId, timestamp) ->
+                    if (now - timestamp > 3000) {
+                        currentTyping.remove(deviceId)
+                        typingTimestamps.remove(deviceId)
+                        changed = true
+                    }
+                }
+                if (changed) {
+                    _typingPeers.value = currentTyping
+                }
+            }
+        }
+
         // Auto restart nearby network if database indicates we are in a room and permissions are met
         viewModelScope.launch(Dispatchers.IO) {
             val activeRoom = roomDao.getRoomSync()
             if (activeRoom != null && permissionManager.checkAllRequiredPermissionsGranted()) {
+                val pass = prefs.getRoomPassword(activeRoom.roomId)
+                PacketSerializer.setRoomPassword(pass)
+                
                 launch(Dispatchers.Main) {
                     startNearbyAndGps(activeRoom.roomId)
                 }
+            }
+        }
+    }
+
+    private fun logPacketTraffic(packet: SamekanPacket, direction: String) {
+        viewModelScope.launch(Dispatchers.IO) {
+            packetLogDao.insertPacketLog(
+                PacketLogEntity(
+                    packetId = packet.messageId,
+                    roomId = packet.roomId,
+                    senderId = packet.senderDeviceId,
+                    type = packet.type.name,
+                    direction = direction,
+                    payloadSize = packet.payload.length,
+                    hopCount = packet.hopCount,
+                    timestamp = System.currentTimeMillis()
+                )
+            )
+
+            // Update stats
+            val existing = memberStatsDao.getStatsForMember(packet.senderDeviceId)
+            if (existing != null) {
+                val sentInc = if (direction == "SENT") 1 else 0
+                val recInc = if (direction == "RECEIVED") 1 else 0
+                memberStatsDao.insertMemberStats(
+                    existing.copy(
+                        packetsSent = existing.packetsSent + sentInc,
+                        packetsReceived = existing.packetsReceived + recInc,
+                        lastSeen = System.currentTimeMillis()
+                    )
+                )
+            } else {
+                memberStatsDao.insertMemberStats(
+                    MemberStatsEntity(
+                        deviceId = packet.senderDeviceId,
+                        displayName = packet.senderDisplayName,
+                        packetsSent = if (direction == "SENT") 1 else 0,
+                        packetsReceived = if (direction == "RECEIVED") 1 else 0,
+                        lastSeen = System.currentTimeMillis()
+                    )
+                )
             }
         }
     }
@@ -282,6 +414,12 @@ class TrekRoomViewModel(application: Application) : AndroidViewModel(application
             locationDao.clearLocations()
             locationHistoryDao.clearAllTrails()
             fileTransferDao.clearTransfers()
+            sosHistoryDao.clearSosHistory()
+            voiceHistoryDao.clearVoiceHistory()
+            packetLogDao.clearPacketLogs()
+            diagnosticsDao.clearDiagnostics()
+            memberStatsDao.clearMemberStats()
+            batteryHistoryDao.clearBatteryHistory()
 
             val passHash = if (!password.isNullOrBlank()) {
                 android.util.Base64.encodeToString(password.toByteArray(), android.util.Base64.NO_WRAP)
@@ -298,6 +436,8 @@ class TrekRoomViewModel(application: Application) : AndroidViewModel(application
                 status = "ACTIVE"
             )
             roomDao.insertRoom(room)
+            prefs.setRoomPassword(roomId, password)
+            PacketSerializer.setRoomPassword(password)
 
             memberDao.insertMember(
                 MemberEntity(
@@ -325,6 +465,12 @@ class TrekRoomViewModel(application: Application) : AndroidViewModel(application
             locationDao.clearLocations()
             locationHistoryDao.clearAllTrails()
             fileTransferDao.clearTransfers()
+            sosHistoryDao.clearSosHistory()
+            voiceHistoryDao.clearVoiceHistory()
+            packetLogDao.clearPacketLogs()
+            diagnosticsDao.clearDiagnostics()
+            memberStatsDao.clearMemberStats()
+            batteryHistoryDao.clearBatteryHistory()
 
             val passHash = if (!password.isNullOrBlank()) {
                 android.util.Base64.encodeToString(password.toByteArray(), android.util.Base64.NO_WRAP)
@@ -341,6 +487,8 @@ class TrekRoomViewModel(application: Application) : AndroidViewModel(application
                 status = "ACTIVE"
             )
             roomDao.insertRoom(room)
+            prefs.setRoomPassword(roomId, password)
+            PacketSerializer.setRoomPassword(password)
 
             memberDao.insertMember(
                 MemberEntity(
@@ -369,6 +517,13 @@ class TrekRoomViewModel(application: Application) : AndroidViewModel(application
             locationDao.clearLocations()
             locationHistoryDao.clearAllTrails()
             fileTransferDao.clearTransfers()
+            sosHistoryDao.clearSosHistory()
+            voiceHistoryDao.clearVoiceHistory()
+            packetLogDao.clearPacketLogs()
+            diagnosticsDao.clearDiagnostics()
+            memberStatsDao.clearMemberStats()
+            batteryHistoryDao.clearBatteryHistory()
+            PacketSerializer.clearRoomKey()
             _distanceWalked.value = 0f
             lastWalkedLocation = null
             _activeSosAlert.value = null
@@ -420,7 +575,6 @@ class TrekRoomViewModel(application: Application) : AndroidViewModel(application
             }
         )
 
-        // Collect GPS Manager status updates
         viewModelScope.launch {
             gpsManager?.statusFlow?.collect {
                 _gpsStatus.value = it
@@ -476,19 +630,26 @@ class TrekRoomViewModel(application: Application) : AndroidViewModel(application
                 senderDisplayName = localDisplayName.value,
                 type = PacketType.TEXT,
                 timestamp = message.timestamp,
-                ttl = 2,
+                ttl = 4,
                 payload = text,
-                targetDeviceId = replyToId
+                targetDeviceId = null, // broadcast chat
+                priority = 1
             )
 
+            logPacketTraffic(packet, "SENT")
             nearbyConnectionManager.broadcastPacket(packet)
-            messageDao.updateMessageStatus(messageId, "SENT")
         }
     }
 
     fun deleteMessageLocal(messageId: String) {
         viewModelScope.launch(Dispatchers.IO) {
             messageDao.deleteMessage(messageId)
+        }
+    }
+
+    fun pinMessage(messageId: String, pinned: Boolean) {
+        viewModelScope.launch(Dispatchers.IO) {
+            messageDao.updateMessagePinned(messageId, pinned)
         }
     }
 
@@ -514,9 +675,31 @@ class TrekRoomViewModel(application: Application) : AndroidViewModel(application
                 type = PacketType.CHAT_ACK,
                 timestamp = System.currentTimeMillis(),
                 ttl = 2,
-                payload = "$messageId:$reactionsString"
+                payload = "$messageId:$reactionsString",
+                priority = 1
             )
+            logPacketTraffic(reactionPacket, "SENT")
             nearbyConnectionManager.broadcastPacket(reactionPacket)
+        }
+    }
+
+    fun sendTypingStatus(isTyping: Boolean) {
+        val room = currentRoom.value ?: return
+        viewModelScope.launch(Dispatchers.IO) {
+            val typingPayload = TypingPayload(isTyping)
+            val json = PacketSerializer.serializeTypingPayload(typingPayload)
+            val packet = SamekanPacket(
+                messageId = "TYP-${localDeviceId}",
+                roomId = room.roomId,
+                senderDeviceId = localDeviceId,
+                senderDisplayName = localDisplayName.value,
+                type = PacketType.TYPING,
+                timestamp = System.currentTimeMillis(),
+                ttl = 1,
+                payload = json,
+                priority = 2
+            )
+            nearbyConnectionManager.broadcastPacket(packet)
         }
     }
 
@@ -532,7 +715,9 @@ class TrekRoomViewModel(application: Application) : AndroidViewModel(application
                 longitude = loc?.longitude ?: 0.0,
                 altitude = loc?.altitude ?: 0.0,
                 accuracy = loc?.accuracy ?: 0f,
-                batteryLevel = getBatteryLevel()
+                batteryLevel = getBatteryLevel(),
+                heading = loc?.bearing ?: 0f,
+                speed = loc?.speed ?: 0f
             )
 
             val packet = SamekanPacket(
@@ -543,10 +728,31 @@ class TrekRoomViewModel(application: Application) : AndroidViewModel(application
                 type = PacketType.SOS_ALERT,
                 timestamp = System.currentTimeMillis(),
                 ttl = 4,
-                payload = PacketSerializer.serializeSosPayload(sosPayload)
+                payload = PacketSerializer.serializeSosPayload(sosPayload),
+                priority = 0
             )
 
+            logPacketTraffic(packet, "SENT")
             nearbyConnectionManager.broadcastPacket(packet)
+
+            sosHistoryDao.insertSosAlert(
+                SosHistoryEntity(
+                    messageId = packet.messageId,
+                    roomId = room.roomId,
+                    senderDeviceId = localDeviceId,
+                    senderDisplayName = localDisplayName.value,
+                    emergencyType = emergencyType,
+                    latitude = sosPayload.latitude,
+                    longitude = sosPayload.longitude,
+                    altitude = sosPayload.altitude,
+                    accuracy = sosPayload.accuracy,
+                    batteryLevel = sosPayload.batteryLevel,
+                    heading = sosPayload.heading,
+                    speed = sosPayload.speed,
+                    timestamp = packet.timestamp,
+                    status = "ACTIVE"
+                )
+            )
 
             _activeSosAlert.value = SosAlertInfo(
                 messageId = packet.messageId,
@@ -565,6 +771,12 @@ class TrekRoomViewModel(application: Application) : AndroidViewModel(application
     }
 
     fun cancelSosAlert() {
+        val current = _activeSosAlert.value
+        if (current != null) {
+            viewModelScope.launch(Dispatchers.IO) {
+                sosHistoryDao.updateSosStatus(current.messageId, "RESOLVED")
+            }
+        }
         _activeSosAlert.value = null
         stopSosAlertResources()
         Logger.info(TAG, "SOS alert canceled locally.")
@@ -580,11 +792,15 @@ class TrekRoomViewModel(application: Application) : AndroidViewModel(application
                 senderDisplayName = localDisplayName.value,
                 type = PacketType.SOS_ACK,
                 timestamp = System.currentTimeMillis(),
-                ttl = 2,
+                ttl = 4,
                 payload = messageId,
-                targetDeviceId = senderId
+                targetDeviceId = senderId,
+                priority = 0
             )
+            logPacketTraffic(ackPacket, "SENT")
             nearbyConnectionManager.broadcastPacket(ackPacket)
+
+            sosHistoryDao.updateSosStatus(messageId, "ACKNOWLEDGED")
 
             val current = _activeSosAlert.value
             if (current != null && current.messageId == messageId) {
@@ -594,12 +810,25 @@ class TrekRoomViewModel(application: Application) : AndroidViewModel(application
         }
     }
 
+    // SHA-256 Checksum generation
+    private fun getFileChecksum(file: File): String {
+        val digest = MessageDigest.getInstance("SHA-256")
+        val bytes = file.readBytes()
+        val hash = digest.digest(bytes)
+        return hash.joinToString("") { "%02x".format(it) }
+    }
+
     fun shareFile(file: File, fileName: String, fileType: String) {
         val room = currentRoom.value ?: return
-        viewModelScope.launch(Dispatchers.IO) {
-            val payloadId = nearbyConnectionManager.sendFile(file, fileName, fileType, room.roomId)
+        val fileId = "FL-${UUID.randomUUID().toString().substring(0, 8).uppercase()}"
+
+        val job = viewModelScope.launch(Dispatchers.IO) {
+            val checksum = getFileChecksum(file)
+            val fileSize = file.length()
+            val totalChunks = ((fileSize + CHUNK_SIZE - 1) / CHUNK_SIZE).toInt()
+
             val dbTransfer = FileTransferEntity(
-                fileId = payloadId.toString(),
+                fileId = fileId,
                 fileName = fileName,
                 fileType = fileType,
                 absolutePath = file.absolutePath,
@@ -608,9 +837,104 @@ class TrekRoomViewModel(application: Application) : AndroidViewModel(application
                 status = "SENDING",
                 timestamp = System.currentTimeMillis(),
                 senderId = localDeviceId,
-                fileSize = file.length()
+                fileSize = fileSize,
+                checksum = checksum,
+                chunkIndex = 0,
+                totalChunks = totalChunks
             )
             fileTransferDao.insertTransfer(dbTransfer)
+
+            // Send header
+            nearbyConnectionManager.sendFileHeader(fileId, fileName, fileType, fileSize, checksum, totalChunks, room.roomId)
+            delay(200)
+
+            val fileBytes = file.readBytes()
+            for (i in 0 until totalChunks) {
+                // Check if transfer was paused
+                val current = fileTransferDao.getTransfersFlow().first().find { it.fileId == fileId }
+                if (current?.status == "PAUSED" || current?.status == "FAILED") {
+                    break
+                }
+
+                val offset = i * CHUNK_SIZE
+                val length = Math.min(fileBytes.size - offset, CHUNK_SIZE)
+                val chunkBytes = fileBytes.copyOfRange(offset, offset + length)
+                val chunkBase64 = android.util.Base64.encodeToString(chunkBytes, android.util.Base64.NO_WRAP)
+
+                nearbyConnectionManager.sendFileChunk(fileId, i, totalChunks, chunkBase64, room.roomId)
+
+                val progress = (i + 1).toFloat() / totalChunks
+                fileTransferDao.updateProgressAndChunk(fileId, progress, "SENDING", i)
+                delay(80) // rate limit
+            }
+
+            // Mark completed
+            val finalCheck = fileTransferDao.getTransfersFlow().first().find { it.fileId == fileId }
+            if (finalCheck?.status == "SENDING") {
+                fileTransferDao.updateProgress(fileId, 1.0f, "COMPLETED")
+            }
+            fileSendingJobs.remove(fileId)
+        }
+        fileSendingJobs[fileId] = job
+    }
+
+    fun pauseFileTransfer(fileId: String) {
+        viewModelScope.launch(Dispatchers.IO) {
+            fileSendingJobs[fileId]?.cancel()
+            fileSendingJobs.remove(fileId)
+            
+            val transfers = fileTransferDao.getTransfersFlow().first()
+            val transfer = transfers.find { it.fileId == fileId }
+            if (transfer != null) {
+                fileTransferDao.updateProgress(fileId, transfer.progress, "PAUSED")
+            }
+        }
+    }
+
+    fun resumeFileTransfer(fileId: String) {
+        val room = currentRoom.value ?: return
+        viewModelScope.launch(Dispatchers.IO) {
+            val transfers = fileTransferDao.getTransfersFlow().first()
+            val transfer = transfers.find { it.fileId == fileId } ?: return@launch
+            
+            val file = File(transfer.absolutePath)
+            if (!file.exists()) {
+                fileTransferDao.updateProgress(fileId, transfer.progress, "FAILED")
+                return@launch
+            }
+
+            val job = launch(Dispatchers.IO) {
+                val totalChunks = transfer.totalChunks
+                val startIndex = transfer.chunkIndex + 1
+                val fileBytes = file.readBytes()
+
+                fileTransferDao.updateProgress(fileId, transfer.progress, "SENDING")
+
+                for (i in startIndex until totalChunks) {
+                    val current = fileTransferDao.getTransfersFlow().first().find { it.fileId == fileId }
+                    if (current?.status == "PAUSED" || current?.status == "FAILED") {
+                        break
+                    }
+
+                    val offset = i * CHUNK_SIZE
+                    val length = Math.min(fileBytes.size - offset, CHUNK_SIZE)
+                    val chunkBytes = fileBytes.copyOfRange(offset, offset + length)
+                    val chunkBase64 = android.util.Base64.encodeToString(chunkBytes, android.util.Base64.NO_WRAP)
+
+                    nearbyConnectionManager.sendFileChunk(fileId, i, totalChunks, chunkBase64, room.roomId)
+
+                    val progress = (i + 1).toFloat() / totalChunks
+                    fileTransferDao.updateProgressAndChunk(fileId, progress, "SENDING", i)
+                    delay(80)
+                }
+
+                val finalCheck = fileTransferDao.getTransfersFlow().first().find { it.fileId == fileId }
+                if (finalCheck?.status == "SENDING") {
+                    fileTransferDao.updateProgress(fileId, 1.0f, "COMPLETED")
+                }
+                fileSendingJobs.remove(fileId)
+            }
+            fileSendingJobs[fileId] = job
         }
     }
 
@@ -658,6 +982,10 @@ class TrekRoomViewModel(application: Application) : AndroidViewModel(application
                     deviceId = localDeviceId,
                     latitude = location.latitude,
                     longitude = location.longitude,
+                    altitude = location.altitude,
+                    bearing = location.bearing,
+                    speed = location.speed,
+                    accuracy = location.accuracy,
                     timestamp = System.currentTimeMillis()
                 )
             )
@@ -670,9 +998,11 @@ class TrekRoomViewModel(application: Application) : AndroidViewModel(application
                 type = PacketType.GPS,
                 timestamp = System.currentTimeMillis(),
                 ttl = 1,
-                payload = PacketSerializer.serializeGpsPayload(gpsPayload)
+                payload = PacketSerializer.serializeGpsPayload(gpsPayload),
+                priority = 2
             )
 
+            logPacketTraffic(packet, "SENT")
             nearbyConnectionManager.broadcastPacket(packet)
         }
     }
@@ -699,8 +1029,10 @@ class TrekRoomViewModel(application: Application) : AndroidViewModel(application
                 type = PacketType.ROOM_SYNC,
                 timestamp = System.currentTimeMillis(),
                 ttl = 2,
-                payload = PacketSerializer.serializeRoomSyncPayload(roomSyncPayload)
+                payload = PacketSerializer.serializeRoomSyncPayload(roomSyncPayload),
+                priority = 1
             )
+            logPacketTraffic(packet, "SENT")
             nearbyConnectionManager.broadcastPacket(packet)
         }
     }
@@ -743,6 +1075,22 @@ class TrekRoomViewModel(application: Application) : AndroidViewModel(application
                         replyToId = packet.targetDeviceId
                     )
                     messageDao.insertMessage(message)
+
+                    // Send ACK
+                    val ackPacket = SamekanPacket(
+                        messageId = "ACK-${UUID.randomUUID().toString().substring(0, 8).uppercase()}",
+                        roomId = packet.roomId,
+                        senderDeviceId = localDeviceId,
+                        senderDisplayName = localDisplayName.value,
+                        type = PacketType.CHAT_ACK,
+                        timestamp = System.currentTimeMillis(),
+                        ttl = 2,
+                        payload = packet.messageId,
+                        targetDeviceId = packet.senderDeviceId,
+                        priority = 1
+                    )
+                    logPacketTraffic(ackPacket, "SENT")
+                    nearbyConnectionManager.sendPacketToPeer(ackPacket, packet.senderDeviceId)
                 }
                 PacketType.GPS -> {
                     val gps = PacketSerializer.deserializeGpsPayload(packet.payload)
@@ -765,6 +1113,10 @@ class TrekRoomViewModel(application: Application) : AndroidViewModel(application
                                 deviceId = packet.senderDeviceId,
                                 latitude = gps.latitude,
                                 longitude = gps.longitude,
+                                altitude = gps.altitude,
+                                bearing = gps.bearing,
+                                speed = gps.speed,
+                                accuracy = gps.accuracy,
                                 timestamp = packet.timestamp
                             )
                         )
@@ -829,7 +1181,7 @@ class TrekRoomViewModel(application: Application) : AndroidViewModel(application
                 }
                 PacketType.PTT_CHUNK -> {
                     val rawAudio = android.util.Base64.decode(packet.payload, android.util.Base64.NO_WRAP)
-                    pttManager.playAudioChunk(packet.senderDisplayName, rawAudio)
+                    pttManager.playAudioChunk(packet.senderDisplayName, packet.sequenceNumber, rawAudio)
                 }
                 PacketType.SOS_ALERT -> {
                     val sos = PacketSerializer.deserializeSosPayload(packet.payload)
@@ -848,6 +1200,25 @@ class TrekRoomViewModel(application: Application) : AndroidViewModel(application
                             acknowledged = false
                         )
                         triggerAlarmAndVibration()
+
+                        sosHistoryDao.insertSosAlert(
+                            SosHistoryEntity(
+                                messageId = packet.messageId,
+                                roomId = packet.roomId,
+                                senderDeviceId = packet.senderDeviceId,
+                                senderDisplayName = packet.senderDisplayName,
+                                emergencyType = sos.emergencyType,
+                                latitude = sos.latitude,
+                                longitude = sos.longitude,
+                                altitude = sos.altitude,
+                                accuracy = sos.accuracy,
+                                batteryLevel = sos.batteryLevel,
+                                heading = sos.heading,
+                                speed = sos.speed,
+                                timestamp = packet.timestamp,
+                                status = "ACTIVE"
+                            )
+                        )
                     }
                 }
                 PacketType.SOS_ACK -> {
@@ -856,6 +1227,7 @@ class TrekRoomViewModel(application: Application) : AndroidViewModel(application
                         _activeSosAlert.value = current.copy(acknowledged = true)
                         stopSosAlertResources()
                     }
+                    sosHistoryDao.updateSosStatus(packet.payload, "ACKNOWLEDGED")
                 }
                 PacketType.CHAT_ACK -> {
                     val parts = packet.payload.split(":", limit = 2)
@@ -863,6 +1235,23 @@ class TrekRoomViewModel(application: Application) : AndroidViewModel(application
                         val messageId = parts[0]
                         val reactions = parts[1]
                         messageDao.updateMessageReactions(messageId, reactions)
+                    } else {
+                        // Regular chat message ACK
+                        messageDao.updateMessageStatus(packet.payload, "SENT")
+                    }
+                }
+                PacketType.TYPING -> {
+                    val typingPayload = PacketSerializer.deserializeTypingPayload(packet.payload)
+                    if (typingPayload != null) {
+                        val current = _typingPeers.value.toMutableMap()
+                        if (typingPayload.isTyping) {
+                            current[packet.senderDeviceId] = packet.senderDisplayName
+                            typingTimestamps[packet.senderDeviceId] = System.currentTimeMillis()
+                        } else {
+                            current.remove(packet.senderDeviceId)
+                            typingTimestamps.remove(packet.senderDeviceId)
+                        }
+                        _typingPeers.value = current
                     }
                 }
                 PacketType.FILE_HEADER -> {
@@ -875,12 +1264,64 @@ class TrekRoomViewModel(application: Application) : AndroidViewModel(application
                             absolutePath = "",
                             isIncoming = true,
                             progress = 0.0f,
-                            status = "SENDING",
+                            status = "DOWNLOADING",
                             timestamp = System.currentTimeMillis(),
                             senderId = packet.senderDeviceId,
-                            fileSize = header.fileSize
+                            fileSize = header.fileSize,
+                            checksum = header.checksum,
+                            chunkIndex = 0,
+                            totalChunks = header.totalChunks
                         )
                         fileTransferDao.insertTransfer(incomingFile)
+
+                        // Create file placeholder in cache directory
+                        val tempFile = File(getApplication<Application>().cacheDir, header.fileId)
+                        if (tempFile.exists()) tempFile.delete()
+                        tempFile.createNewFile()
+                    }
+                }
+                PacketType.FILE_CHUNK -> {
+                    val chunk = PacketSerializer.deserializeFileChunkPayload(packet.payload)
+                    if (chunk != null) {
+                        val tempFile = File(getApplication<Application>().cacheDir, chunk.fileId)
+                        if (tempFile.exists()) {
+                            val decoded = android.util.Base64.decode(chunk.data, android.util.Base64.NO_WRAP)
+                            val raf = RandomAccessFile(tempFile, "rw")
+                            raf.seek(chunk.chunkIndex * CHUNK_SIZE.toLong())
+                            raf.write(decoded)
+                            raf.close()
+
+                            val progress = (chunk.chunkIndex + 1).toFloat() / chunk.totalChunks
+                            
+                            val isLast = chunk.chunkIndex == chunk.totalChunks - 1
+                            if (isLast) {
+                                // Calculate checksum
+                                val localChecksum = getFileChecksum(tempFile)
+                                val dbTransfers = fileTransferDao.getTransfersFlow().first()
+                                val transfer = dbTransfers.find { it.fileId == chunk.fileId }
+                                if (transfer != null && localChecksum == transfer.checksum) {
+                                    // Move to permanent app files dir
+                                    val destDir = File(getApplication<Application>().filesDir, "trek_shared_files")
+                                    if (!destDir.exists()) destDir.mkdirs()
+                                    val destFile = File(destDir, transfer.fileName)
+                                    tempFile.renameTo(destFile)
+
+                                    fileTransferDao.insertTransfer(
+                                        transfer.copy(
+                                            absolutePath = destFile.absolutePath,
+                                            progress = 1.0f,
+                                            status = "COMPLETED",
+                                            chunkIndex = chunk.chunkIndex
+                                        )
+                                    )
+                                } else {
+                                    fileTransferDao.updateProgress(chunk.fileId, progress, "FAILED")
+                                    tempFile.delete()
+                                }
+                            } else {
+                                fileTransferDao.updateProgressAndChunk(chunk.fileId, progress, "DOWNLOADING", chunk.chunkIndex)
+                            }
+                        }
                     }
                 }
                 else -> {}

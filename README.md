@@ -6,25 +6,35 @@ The project is fully refactored to comply with Android 14+ (API 34-36) Foregroun
 
 ---
 
-## Technical Architecture & Compliance (Android 14+)
+## Key Features & Production Enhancements
 
-### 1. Foreground Service Decoupling
-- **Decoupled FGS Types**: The persistent background service (`TrekForegroundService`) is configured in the manifest to run using only the `location` and `connectedDevice` types. It coordinates GPS polling and Nearby Connection network advertising/discovery in the background.
-- **On-Demand Microphone**: Access to the microphone (`RECORD_AUDIO`) is requested only during active Push-To-Talk (PTT) use in the foreground. The foreground service does NOT run with `microphone` type continuously, eliminating immediate startup crashes on Android 14+ devices.
-- **Crash Prevention**: All calls transitioning to Foreground Service are wrapped in try-catch blocks to catch `SecurityException` gracefully.
+### 1. End-To-End Security (AES-256-GCM)
+- **CryptoHelper**: Encapsulates standard `AES/GCM/NoPadding` encryption using random 12-byte IVs and 128-bit authentication tags.
+- **Key Derivation**: Keys are derived from custom room passwords via SHA-256. If a room does not have a password, the key is derived from the `roomId` as a fallback, ensuring traffic isolation.
+- **Plaintext Headers**: Encryption is performed transparently inside `PacketSerializer` on the `payload` string only. Headers (e.g. sender, messageId, TTL, hop count) remain in plaintext so intermediate mesh nodes can route packets without needing the decryption keys.
 
-### 2. Consolidated Permission Manager
-- **Dynamic API Mapping**: Centralized in `PermissionManager` to check and request the exact permissions needed depending on the device's Android OS version (handling Bluetooth Scan/Connect/Advertise on API 31+, and Nearby WiFi / Post Notifications on API 33+).
-- **Graceful Revocation**: Monitors permission states dynamically. If permissions are revoked during runtime, the background service is immediately stopped to prevent crashes.
-- **Rationale Dialogs**: Built a beautiful Compose Permission Screen explaining exactly why each permission is required (e.g. Bluetooth for offline mesh, Location for radar coordinates, Camera for room QR scanning, Microphone for PTT walkie-talkie).
+### 2. Reliable Delivery & Mesh Routing
+- **Retransmission Queue**: A background scheduler in `NearbyConnectionManager` tracks outgoing reliable packets (chat messages, file headers, chunks) and re-sends them if an ACK isn't received within 3000ms. It retries up to 3 times before updating the message status to `FAILED`.
+- **Loop Prevention**: Active packets are tracked in a thread-safe `duplicatePacketCache` on each node. Re-captured packets are dropped immediately to prevent loop amplification.
+- **TTL Decrement Mesh**: Packets are broadcasted with a Time-To-Live (TTL) field. Intermediate nodes automatically decrement the TTL, increment the `hopCount`, and relay the packet to peers (excluding the packet source).
 
-### 3. Hardware Lifecycle Optimizations
-- **On-Demand PTT Recorder**: In `PTTManager`, the `AudioRecord` is instantiated only when the user presses and holds the microphone button, and is immediately released and destroyed when the user releases it. No microphone resources are held in the background.
-- **Adaptive GPS Tracker**: In `GpsManager`, coordinate requests are dynamically adjusted based on permissions, airplane mode, battery saver settings, and system provider states, reporting status flags to the UI.
-- **Multi-Hop SOS Mesh**: High-priority SOS packets propagate through peers using mesh routing (automatically decrementing TTL limits and dropping duplicate packet IDs) to extend coverage across rugged trails.
+### 3. Walkie-Talkie (PTT) Jitter Buffer
+- **Jitter Priority Queue**: Voice packets are sequence-numbered at source. The playback loop in `PTTManager` buffers incoming chunks in a sorted `PriorityQueue`, playing them back sequentially.
+- **Audio Loss Concealment**: If a packet in the sequence is lost or delayed, the player automatically inserts a brief silent frame to conceal the loss and prevent stuttering.
 
-### 4. Consolidated Logger Utility
-- **Diagnostic Terminal**: The central `Logger` coordinates log messages (`debug`, `info`, `warn`, `error`) and forwards them directly to the UI diagnostic monitor while mirroring to Android Logcat.
+### 4. Chunked & Resumable File Sharing
+- **Chunk Size**: Files are split into 32KB binary blocks encoded in Base64.
+- **State Control**: Users can **Pause** sending. The sending loop breaks instantly, saving the progress and chunk offset. Clicking **Resume** launches a coroutine that continues writing from `chunkIndex + 1`.
+- **Integrity Validation**: Once the final chunk is received, the app computes the SHA-256 hash of the reconstructed file and compares it with the checksum in the file header before moving it to destination storage.
+
+### 5. Adaptive GPS & Power Optimization
+- **Power Saver Awareness**: The `GpsManager` monitors device power states. If Android Battery Saver mode is active, the GPS polling interval is automatically throttled to a minimum of 30 seconds to conserve battery life.
+
+### 6. Tactical Canvas Map & Sweeping Radar
+- **Radar Compass**: Animates a rotating sweep gradient sector. Displays distance, battery, and ping latency in real-time under each member's callsign dot. Direction ticks (N, S, E, W) circle the outer ring.
+- **Private Trail Map**: Draws concentric distance scale rings (50m, 100m, 200m) around the user. Trail breadcrumbs are color-coded based on altitude elevations. Draws translucent GPS accuracy circles and a rotating needle compass overlay.
+- **Emergency SOS Warnings**: When a member triggers an SOS, a pulsing warning indicator shows up on both the Map and Radar canvas overlays.
+- **Diagnostics Screen**: Displays real-time estimated bandwidth, link protocols, RTT latency, a live packet routing audit log, and peer performance statistics.
 
 ---
 
@@ -33,6 +43,7 @@ The project is fully refactored to comply with Android 14+ (API 34-36) Foregroun
 * **Minimum SDK**: Android 10+ (API 29)
 * **Target SDK**: Android 14+ (API 34/36)
 * **Gradle Toolchain**: JDK 17 (Eclipse Adoptium 17)
+* **Database**: Room Database version 3 with destructive fallback.
 * **Hardware**: Physical devices with functional Bluetooth, Wi-Fi, and GPS antennas.
 
 ### Build Instructions
@@ -59,7 +70,7 @@ Follow this script using **4 physical Android devices** (e.g., Phone A, B, C, an
 ---
 
 ### Test 1: Two-Phone Connection & FGS Boot
-1. **Phone A**: Tap **CREATE OFFLINE ROOM**. Enter room name `"Rajgad Sunday Trek"`.
+1. **Phone A**: Tap **CREATE OFFLINE ROOM**. Enter room name `"Rajgad Sunday Trek"`. Optionally enter password `"TrekSecure123"`.
 2. A QR Code containing the Room ID (e.g. `T-ROOM-RAJ8`) is displayed.
 3. **Phone B**: Tap **SCAN QR** and scan Phone A's screen.
 4. Verify matching authentication digits (e.g., `123-456`) and tap **ACCEPT** on both.
@@ -101,14 +112,12 @@ Follow this script using **4 physical Android devices** (e.g., Phone A, B, C, an
    * Phone A and B (despite being out of range of D) receive the SOS, play the alarm, and render direction guides showing distance/bearing to Phone D.
    * Tap **SEND ACKNOWLEDGEMENT** on Phone A: verify that D receives the ack packet via the mesh relay and silences its local emergency alert.
 
-### Test 6: Offline Trail Map
+### Test 6: Offline Trail Map & Resumable File sharing
 1. Walk 50 meters with **Phone B** in any direction.
 2. **Verification on Phone A**:
    * Go to the **Map** tab.
    * Verify that Phone B's movements are tracked as breadcrumbs on the zoomable Canvas vector map.
    * Toggle **Heading Sync**: verify the canvas rotates dynamically based on the compass direction.
-
-### Test 7: Local Boot Validation & Connection Recovery
-1. Force close the app on **Phone B** (simulating a crash or battery pull).
-2. Start the app. Verify it restores the last room config automatically and re-registers listeners.
-3. Bring B back near the other phones: verify Nearby Connections auto-reconnects with exponential backoff, restoring connections without requiring a manual QR scan.
+3. Go to the **Chat** tab on **Phone A**, click the attachment icon, pick a large GPX trail, and start sharing.
+   * Press the **Pause** icon on Phone A: verify progress halts immediately.
+   * Press the **Resume/Play** icon: verify chunk streams continue, finalize transfer, and verify checksum match.

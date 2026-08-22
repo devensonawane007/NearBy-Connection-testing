@@ -12,9 +12,15 @@ import androidx.room.RoomDatabase
         MessageEntity::class,
         LocationEntity::class,
         LocationHistoryEntity::class,
-        FileTransferEntity::class
+        FileTransferEntity::class,
+        SosHistoryEntity::class,
+        VoiceHistoryEntity::class,
+        PacketLogEntity::class,
+        DiagnosticsEntity::class,
+        MemberStatsEntity::class,
+        BatteryHistoryEntity::class
     ],
-    version = 2,
+    version = 3,
     exportSchema = false
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -24,6 +30,12 @@ abstract class AppDatabase : RoomDatabase() {
     abstract fun locationDao(): LocationDao
     abstract fun locationHistoryDao(): LocationHistoryDao
     abstract fun fileTransferDao(): FileTransferDao
+    abstract fun sosHistoryDao(): SosHistoryDao
+    abstract fun voiceHistoryDao(): VoiceHistoryDao
+    abstract fun packetLogDao(): PacketLogDao
+    abstract fun diagnosticsDao(): DiagnosticsDao
+    abstract fun memberStatsDao(): MemberStatsDao
+    abstract fun batteryHistoryDao(): BatteryHistoryDao
 
     companion object {
         @Volatile

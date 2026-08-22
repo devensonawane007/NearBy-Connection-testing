@@ -41,4 +41,12 @@ class PreferenceHelper(context: Context) {
     fun setGpsIntervalSeconds(seconds: Int) {
         prefs.edit().putInt(KEY_GPS_INTERVAL, seconds).apply()
     }
+
+    fun getRoomPassword(roomId: String): String? {
+        return prefs.getString("room_pwd_$roomId", null)
+    }
+
+    fun setRoomPassword(roomId: String, password: String?) {
+        prefs.edit().putString("room_pwd_$roomId", password).apply()
+    }
 }

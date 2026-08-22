@@ -72,6 +72,7 @@ class GpsManager(
             return
         }
 
+        var adaptedIntervalSeconds = updateIntervalSeconds
         val isAirplaneMode = Settings.Global.getInt(context.contentResolver, Settings.Global.AIRPLANE_MODE_ON, 0) != 0
         if (isAirplaneMode) {
             Logger.warn(TAG, "Airplane mode is active. GPS may be degraded.")
@@ -79,11 +80,13 @@ class GpsManager(
         }
 
         if (powerManager.isPowerSaveMode) {
-            Logger.warn(TAG, "Battery Saver is active. GPS updates may be delayed.")
+            // Adaptive GPS: Slow down GPS interval if battery is low / power saver is active
+            adaptedIntervalSeconds = updateIntervalSeconds.coerceAtLeast(30)
+            Logger.warn(TAG, "Battery Saver is active. Adapting GPS interval to ${adaptedIntervalSeconds}s.")
             _statusFlow.value = GpsStatus.BatterySaverActive
         }
 
-        val intervalMillis = updateIntervalSeconds * 1000L
+        val intervalMillis = adaptedIntervalSeconds * 1000L
         val locationRequest = LocationRequest.Builder(
             Priority.PRIORITY_HIGH_ACCURACY,
             intervalMillis
